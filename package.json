@@ -1,5 +1,5 @@
 {
-  "name": "@justinebert/minimal-mcp",
+  "name": "@JEbertPrime/minimal-mcp",
   "version": "1.0.0",
   "description": "Minimal MCP client for the web — spec 2025-11-25 (roots, sampling, elicitation, tasks, ping, cancellation, progress)",
   "license": "MIT",
