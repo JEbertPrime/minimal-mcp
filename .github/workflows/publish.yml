@@ -1,0 +1,50 @@
+name: Publish to GitHub Packages
+
+on:
+  release:
+    # Trigger only on published releases (not drafts/prereleases unless you want them).
+    types: [published]
+
+  # Allow manual runs from the Actions tab for testing.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry-run (pack but do not publish)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write # required to push to GitHub Packages
+
+jobs:
+  publish:
+    name: Build & publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://npm.pkg.github.com"
+          # Scopes the auth token to the GitHub Packages registry.
+          scope: "@justinebert"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build library
+        run: npm run build:lib
+
+      - name: Pack (dry-run inspection)
+        run: npm pack --dry-run
+
+      - name: Publish
+        if: ${{ !inputs.dry_run }}
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
