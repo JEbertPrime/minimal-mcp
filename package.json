@@ -1,6 +1,6 @@
 {
   "name": "simple-browser-mcp-client",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Minimal MCP client for the web — spec 2025-11-25 (roots, sampling, elicitation, tasks, ping, cancellation, progress)",
   "keywords": [
     "mcp",
