@@ -16,18 +16,7 @@
  * § utilities/progress     – handle incoming notifications/progress; progressToken in requests
  *
  * Transport: Streamable HTTP (POST + GET SSE), with legacy HTTP+SSE fallback
- * § basic/authorization – OAuth 2.1 (optional, via MCPClientOptions.auth)
  */
-
-// ─────────────────────────────────────────────────────────────────────────────
-// OAuth – import internals, re-export public surface
-// ─────────────────────────────────────────────────────────────────────────────
-
-import { OAuthHandler, UnauthorizedError } from "./oauth";
-import type { OAuthClientProvider } from "./oauth";
-
-export { UnauthorizedError } from "./oauth";
-export type { OAuthClientProvider, OAuthClientMetadata, OAuthTokens } from "./oauth";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -428,14 +417,6 @@ export interface MCPClientOptions {
    * Interval ms for server keepalive pings. 0 = disabled (default).
    */
   pingIntervalMs?: number;
-
-  /**
-   * OAuth 2.1 authorization provider (§ basic/authorization).
-   * When set, the client automatically injects `Authorization: Bearer` headers
-   * and handles 401 responses with silent token refresh.
-   * Call `client.authorize()` / `client.finishAuth()` to complete the flow.
-   */
-  auth?: OAuthClientProvider;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -530,10 +511,6 @@ export class MCPClient extends EventTarget {
   // Server-provided usage instructions (from initialize response)
   private _instructions: string | null = null;
 
-  // OAuth (§ basic/authorization)
-  private _oauth: OAuthHandler | null = null;
-  private readonly _resourceUrl: string;
-
   // ──────────────────────────────────────────────────────────────────────────
   // Constructor
   // ──────────────────────────────────────────────────────────────────────────
@@ -553,10 +530,6 @@ export class MCPClient extends EventTarget {
     this._roots = options.initialRoots
       ? this.validateAndCopyRoots(options.initialRoots)
       : [];
-    this._resourceUrl = deriveResourceUrl(options.endpoint);
-    if (options.auth) {
-      this._oauth = new OAuthHandler(options.auth, this._resourceUrl);
-    }
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -606,7 +579,6 @@ export class MCPClient extends EventTarget {
 
   async connect(): Promise<ServerInfo> {
     if (this._connected) throw new Error("Already connected");
-    if (this._oauth) await this._oauth.loadStoredTokens();
     await this.initialize();
     this._connected = true;
     this.startListenStream();
@@ -730,38 +702,15 @@ export class MCPClient extends EventTarget {
       this.postMessage(message)
         .then(async (res) => {
           if (!res.ok) {
-            // § Authorization: on 401, try silent token refresh then retry once
-            if (res.status === 401 && this._oauth) {
-              const wwwAuth = res.headers.get("WWW-Authenticate") ?? undefined;
-              try {
-                const refreshed = await this._oauth.tryRefresh();
-                if (refreshed) {
-                  const retry = await this.postMessage(message);
-                  if (!retry.ok) {
-                    this.settlePending(
-                      id,
-                      undefined,
-                      new Error(`HTTP ${retry.status} (after token refresh)`),
-                    );
-                    return;
-                  }
-                  await this.routeRPCResponse(retry);
-                  return;
-                }
-              } catch {
-                this._oauth.clearTokens();
-              }
-              this.settlePending(
-                id,
-                undefined,
-                new UnauthorizedError("Re-authorization required", wwwAuth),
-              );
-              return;
-            }
             this.settlePending(id, undefined, new Error(`HTTP ${res.status}`));
             return;
           }
-          await this.routeRPCResponse(res);
+          const ct = res.headers.get("Content-Type") ?? "";
+          if (ct.includes("text/event-stream") && res.body) {
+            await this.drainSSEStream(res.body);
+          } else {
+            this.routeResponse((await res.json()) as JSONRPCResponse);
+          }
         })
         .catch((err: unknown) => {
           this.settlePending(
@@ -882,7 +831,6 @@ export class MCPClient extends EventTarget {
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json, text/event-stream",
-        ...this.authHeader(),
       },
       body: JSON.stringify(initReq),
     });
@@ -890,15 +838,6 @@ export class MCPClient extends EventTarget {
     // § Backwards compatibility: probe old HTTP+SSE (2024-11-05) on 400/404/405.
     if ([400, 404, 405].includes(res.status)) {
       res = await this.probeOldSSETransport(initReq);
-    }
-
-    // § Authorization: 401 means auth flow must complete before connecting.
-    if (res.status === 401) {
-      throw new UnauthorizedError(
-        "Server requires authorization before connecting. " +
-          "Call client.authorize() then client.finishAuth() first.",
-        res.headers.get("WWW-Authenticate") ?? undefined,
-      );
     }
 
     if (!res.ok) throw new Error(`Initialize failed: HTTP ${res.status}`);
@@ -1013,7 +952,6 @@ export class MCPClient extends EventTarget {
       try {
         const headers: Record<string, string> = {
           Accept: "text/event-stream",
-          ...this.authHeader(),
           ...this.sessionHeaders(),
         };
         if (lastEventId) headers["Last-Event-ID"] = lastEventId;
@@ -1129,16 +1067,6 @@ export class MCPClient extends EventTarget {
     if (isResponse(msg)) this.routeResponse(msg);
     else if (isRequest(msg)) await this.handleServerRequest(msg);
     else if (isNotification(msg)) this.handleServerNotification(msg);
-  }
-
-  /** Route a successful HTTP response to the appropriate pending request. */
-  private async routeRPCResponse(res: Response): Promise<void> {
-    const ct = res.headers.get("Content-Type") ?? "";
-    if (ct.includes("text/event-stream") && res.body) {
-      await this.drainSSEStream(res.body);
-    } else {
-      this.routeResponse((await res.json()) as JSONRPCResponse);
-    }
   }
 
   private routeResponse(msg: JSONRPCResponse): void {
@@ -1705,14 +1633,8 @@ export class MCPClient extends EventTarget {
     return {
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
-      ...this.authHeader(),
       ...this.sessionHeaders(),
     };
-  }
-
-  private authHeader(): Record<string, string> {
-    const token = this._oauth?.getAccessToken();
-    return token ? { Authorization: `Bearer ${token}` } : {};
   }
 
   private sessionHeaders(): Record<string, string> {
@@ -1952,79 +1874,11 @@ export class MCPClient extends EventTarget {
   sendRootsListChanged(): Promise<void> {
     return this.sendNotification("notifications/roots/list_changed");
   }
-
-  // ── OAuth authorization (§ basic/authorization) ───────────────────────────
-
-  /**
-   * Start the OAuth 2.1 authorization flow.
-   *
-   * Discovers the authorization server, builds a PKCE authorization URL, and
-   * calls `provider.redirectToAuthorization(url)` automatically.  Returns the
-   * URL so callers can also handle the redirect themselves if needed.
-   *
-   * After the user completes auth in the browser and is redirected back to
-   * `redirectUri`, call `finishAuth(callbackUrl)` with the full callback URL.
-   * Then call `connect()` to establish the MCP session.
-   *
-   * @param wwwAuthHeader  Optional `WWW-Authenticate` header value from a 401
-   *                       response.  Provides the `resource_metadata` URL and
-   *                       scope hints when available.
-   * @throws {Error}  If no `auth` provider was configured.
-   */
-  async authorize(wwwAuthHeader?: string): Promise<URL> {
-    if (!this._oauth) {
-      throw new Error(
-        "No auth provider configured. Set MCPClientOptions.auth before calling authorize().",
-      );
-    }
-    const url = await this._oauth.buildAuthorizationUrl(wwwAuthHeader);
-    await this._oauth.provider.redirectToAuthorization(url);
-    return url;
-  }
-
-  /**
-   * Complete the OAuth 2.1 authorization flow after the browser callback.
-   *
-   * Call this from your OAuth callback handler with the full callback URL
-   * (including `code` and `state` query parameters).  After this resolves,
-   * tokens are persisted and `connect()` can be called successfully.
-   *
-   * @param callbackUrl  The full URL the browser was redirected to, e.g.
-   *                     `new URL(window.location.href)`.
-   * @throws {Error}  If no `auth` provider was configured or state mismatches.
-   */
-  async finishAuth(callbackUrl: URL | string): Promise<void> {
-    if (!this._oauth) {
-      throw new Error(
-        "No auth provider configured. Set MCPClientOptions.auth before calling finishAuth().",
-      );
-    }
-    await this._oauth.finishAuthorization(callbackUrl);
-  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Resolve the MCP endpoint to a canonical absolute URL suitable for use as the
- * OAuth `resource` parameter (RFC 8707).  Strips fragment, query string, and
- * trailing slash per spec § 8.1.
- */
-function deriveResourceUrl(endpoint: string): string {
-  try {
-    const base =
-      typeof window !== "undefined" ? window.location.href : undefined;
-    const url = new URL(endpoint, base);
-    url.hash = "";
-    url.search = "";
-    const href = url.href;
-    return href.endsWith("/") ? href.slice(0, -1) : href;
-  } catch {
-    return endpoint;
-  }
-}
 
 function isTerminalStatus(s: TaskStatus): boolean {
   return s === "completed" || s === "failed" || s === "cancelled";
