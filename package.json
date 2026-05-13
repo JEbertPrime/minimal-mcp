@@ -1,8 +1,21 @@
 {
-  "name": "@JEbertPrime/minimal-mcp",
-  "version": "1.0.0",
+  "name": "simple-browser-mcp-client",
+  "version": "0.0.1",
   "description": "Minimal MCP client for the web — spec 2025-11-25 (roots, sampling, elicitation, tasks, ping, cancellation, progress)",
-  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "browser"
+  ],
+  "homepage": "https://github.com/JEbertPrime/minimal-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/JEbertPrime/minimal-mcp/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JEbertPrime/minimal-mcp.git"
+  },
+  "license": "Unlicense",
+  "author": "JEbertPrime",
   "type": "module",
   "exports": {
     ".": {
@@ -12,12 +25,13 @@
     }
   },
   "main": "./dist/mcp-client.cjs",
-  "module": "./dist/mcp-client.js",
   "types": "./dist/mcp-client.d.ts",
+  "directories": {
+    "test": "tests"
+  },
   "files": [
     "dist"
   ],
-  "sideEffects": false,
   "scripts": {
     "dev": "vite",
     "build": "rollup -c && vite build",
@@ -26,8 +40,28 @@
     "test": "MCP_CONFORMANCE_SCENARIO=${MCP_CONFORMANCE_SCENARIO:-initialize} tsx --tsconfig tsconfig.test.json tests/client.ts",
     "prepublishOnly": "npm run build:lib"
   },
-  "publishConfig": {
-    "registry": "https://npm.pkg.github.com"
+  "dependencies": {
+    "convert-source-map": "^2.0.0",
+    "es-errors": "^1.3.0",
+    "esbuild": "^0.21.5",
+    "estree-walker": "^2.0.2",
+    "fsevents": "^2.3.3",
+    "function-bind": "^1.1.2",
+    "get-tsconfig": "^4.14.0",
+    "hasown": "^2.0.3",
+    "is-core-module": "^2.16.2",
+    "js-tokens": "^4.0.0",
+    "magic-string": "^0.30.21",
+    "nanoid": "^3.3.12",
+    "path-parse": "^1.0.7",
+    "picocolors": "^1.1.1",
+    "picomatch": "^4.0.4",
+    "postcss": "^8.5.14",
+    "resolve": "^1.22.12",
+    "resolve-pkg-maps": "^1.0.0",
+    "source-map-js": "^1.2.1",
+    "supports-preserve-symlinks-flag": "^1.0.0",
+    "undici-types": "^7.21.0"
   },
   "devDependencies": {
     "@rollup/plugin-typescript": "^12.1.0",
@@ -38,5 +72,8 @@
     "tsx": "^4.21.0",
     "typescript": "^5.5.0",
     "vite": "^5.4.0"
-  }
+  },
+
+  "module": "./dist/mcp-client.js",
+  "sideEffects": false
 }

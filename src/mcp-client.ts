@@ -16,7 +16,18 @@
  * § utilities/progress     – handle incoming notifications/progress; progressToken in requests
  *
  * Transport: Streamable HTTP (POST + GET SSE), with legacy HTTP+SSE fallback
+ * § basic/authorization – OAuth 2.1 (optional, via MCPClientOptions.auth)
  */
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OAuth – import internals, re-export public surface
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { OAuthHandler, UnauthorizedError } from "./oauth";
+import type { OAuthClientProvider } from "./oauth";
+
+export { UnauthorizedError } from "./oauth";
+export type { OAuthClientProvider, OAuthClientMetadata, OAuthTokens } from "./oauth";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -261,6 +272,80 @@ export interface ServerInfo {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// MCP domain types – SDK-compatible high-level types
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface Tool {
+  name: string;
+  description?: string;
+  inputSchema?: Record<string, unknown>;
+}
+
+export interface Resource {
+  uri: string;
+  name: string;
+  description?: string;
+  mimeType?: string;
+}
+
+export interface ResourceTemplate {
+  uriTemplate: string;
+  name: string;
+  description?: string;
+  mimeType?: string;
+}
+
+export interface Prompt {
+  name: string;
+  description?: string;
+  arguments?: Array<{ name: string; description?: string; required?: boolean }>;
+}
+
+export type LoggingLevel =
+  | "debug"
+  | "info"
+  | "notice"
+  | "warning"
+  | "error"
+  | "critical"
+  | "alert"
+  | "emergency";
+
+export interface CallToolOptions {
+  /** Per-request timeout in ms (overrides defaultTimeoutMs). */
+  timeout?: number;
+  /** Absolute ceiling in ms — request fails even if resetTimeoutOnProgress keeps resetting. */
+  maxTotalTimeout?: number;
+  /** Reset the per-request timeout each time a progress notification arrives. */
+  resetTimeoutOnProgress?: boolean;
+  /** Called for each progress notification while the tool runs. */
+  onprogress?: (params: { progress: number; total?: number }) => void;
+}
+
+export interface CallToolResult {
+  content: Array<{ type: string; [key: string]: unknown }>;
+  isError?: boolean;
+  structuredContent?: Record<string, unknown>;
+}
+
+export interface CompleteRef {
+  type: "ref/prompt" | "ref/resource";
+  name?: string;
+  uri?: string;
+}
+
+export interface CompleteParams {
+  ref: CompleteRef;
+  argument: { name: string; value: string };
+}
+
+export interface CompletionResult {
+  values: string[];
+  total?: number;
+  hasMore?: boolean;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Handler types
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -343,6 +428,14 @@ export interface MCPClientOptions {
    * Interval ms for server keepalive pings. 0 = disabled (default).
    */
   pingIntervalMs?: number;
+
+  /**
+   * OAuth 2.1 authorization provider (§ basic/authorization).
+   * When set, the client automatically injects `Authorization: Bearer` headers
+   * and handles 401 responses with silent token refresh.
+   * Call `client.authorize()` / `client.finishAuth()` to complete the flow.
+   */
+  auth?: OAuthClientProvider;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -353,6 +446,8 @@ interface PendingRequest {
   resolve: (v: unknown) => void;
   reject: (e: Error) => void;
   timeoutId?: ReturnType<typeof setTimeout>;
+  /** Progress token associated with this request, for cleanup and timeout reset. */
+  progressToken?: string | number;
 }
 interface SSEEvent {
   data: string;
@@ -414,6 +509,31 @@ export class MCPClient extends EventTarget {
   // Tasks the client is executing as receiver (experimental)
   private clientTasks = new Map<string, ClientTask>();
 
+  // SDK-compatible handler registries
+  private _notificationHandlers = new Map<
+    string,
+    (n: { method: string; params?: unknown }) => void | Promise<void>
+  >();
+  private _serverRequestHandlers = new Map<
+    string,
+    (r: { method: string; params?: unknown }) => Promise<unknown>
+  >();
+
+  // Per-request progress state (keyed by progressToken)
+  private _progressHandlers = new Map<
+    string | number,
+    (p: { progress: number; total?: number }) => void
+  >();
+  private _progressTokenToId = new Map<string | number, JSONRPCId>();
+  private _progressResetMs = new Map<string | number, number>();
+
+  // Server-provided usage instructions (from initialize response)
+  private _instructions: string | null = null;
+
+  // OAuth (§ basic/authorization)
+  private _oauth: OAuthHandler | null = null;
+  private readonly _resourceUrl: string;
+
   // ──────────────────────────────────────────────────────────────────────────
   // Constructor
   // ──────────────────────────────────────────────────────────────────────────
@@ -433,6 +553,10 @@ export class MCPClient extends EventTarget {
     this._roots = options.initialRoots
       ? this.validateAndCopyRoots(options.initialRoots)
       : [];
+    this._resourceUrl = deriveResourceUrl(options.endpoint);
+    if (options.auth) {
+      this._oauth = new OAuthHandler(options.auth, this._resourceUrl);
+    }
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -482,6 +606,7 @@ export class MCPClient extends EventTarget {
 
   async connect(): Promise<ServerInfo> {
     if (this._connected) throw new Error("Already connected");
+    if (this._oauth) await this._oauth.loadStoredTokens();
     await this.initialize();
     this._connected = true;
     this.startListenStream();
@@ -577,7 +702,11 @@ export class MCPClient extends EventTarget {
     return new Promise<T>((resolve, reject) => {
       const ms = options?.timeoutMs ?? this.defaultTimeoutMs;
       const timeoutId = setTimeout(() => {
+        const pr = this.pendingRequests.get(id);
         this.pendingRequests.delete(id);
+        if (pr?.progressToken !== undefined) {
+          this._progressTokenToId.delete(pr.progressToken);
+        }
         // § Cancellation: send notifications/cancelled on timeout.
         this.sendNotification("notifications/cancelled", {
           requestId: id,
@@ -590,20 +719,49 @@ export class MCPClient extends EventTarget {
         resolve: resolve as (v: unknown) => void,
         reject,
         timeoutId,
+        ...(options?.progressToken !== undefined && {
+          progressToken: options.progressToken,
+        }),
       });
+      if (options?.progressToken !== undefined) {
+        this._progressTokenToId.set(options.progressToken, id);
+      }
 
       this.postMessage(message)
         .then(async (res) => {
           if (!res.ok) {
+            // § Authorization: on 401, try silent token refresh then retry once
+            if (res.status === 401 && this._oauth) {
+              const wwwAuth = res.headers.get("WWW-Authenticate") ?? undefined;
+              try {
+                const refreshed = await this._oauth.tryRefresh();
+                if (refreshed) {
+                  const retry = await this.postMessage(message);
+                  if (!retry.ok) {
+                    this.settlePending(
+                      id,
+                      undefined,
+                      new Error(`HTTP ${retry.status} (after token refresh)`),
+                    );
+                    return;
+                  }
+                  await this.routeRPCResponse(retry);
+                  return;
+                }
+              } catch {
+                this._oauth.clearTokens();
+              }
+              this.settlePending(
+                id,
+                undefined,
+                new UnauthorizedError("Re-authorization required", wwwAuth),
+              );
+              return;
+            }
             this.settlePending(id, undefined, new Error(`HTTP ${res.status}`));
             return;
           }
-          const ct = res.headers.get("Content-Type") ?? "";
-          if (ct.includes("text/event-stream") && res.body) {
-            await this.drainSSEStream(res.body);
-          } else {
-            this.routeResponse((await res.json()) as JSONRPCResponse);
-          }
+          await this.routeRPCResponse(res);
         })
         .catch((err: unknown) => {
           this.settlePending(
@@ -724,6 +882,7 @@ export class MCPClient extends EventTarget {
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json, text/event-stream",
+        ...this.authHeader(),
       },
       body: JSON.stringify(initReq),
     });
@@ -731,6 +890,15 @@ export class MCPClient extends EventTarget {
     // § Backwards compatibility: probe old HTTP+SSE (2024-11-05) on 400/404/405.
     if ([400, 404, 405].includes(res.status)) {
       res = await this.probeOldSSETransport(initReq);
+    }
+
+    // § Authorization: 401 means auth flow must complete before connecting.
+    if (res.status === 401) {
+      throw new UnauthorizedError(
+        "Server requires authorization before connecting. " +
+          "Call client.authorize() then client.finishAuth() first.",
+        res.headers.get("WWW-Authenticate") ?? undefined,
+      );
     }
 
     if (!res.ok) throw new Error(`Initialize failed: HTTP ${res.status}`);
@@ -743,6 +911,8 @@ export class MCPClient extends EventTarget {
     this.negotiatedVersion = result.protocolVersion ?? PROTOCOL_VERSION;
     this._serverCapabilities = result.capabilities ?? {};
     this._serverInfo = result.serverInfo ?? null;
+    this._instructions =
+      (result as unknown as { instructions?: string }).instructions ?? null;
 
     // § Lifecycle: send notifications/initialized before any other messages.
     await this.postRaw({ jsonrpc: "2.0", method: "notifications/initialized" });
@@ -843,6 +1013,7 @@ export class MCPClient extends EventTarget {
       try {
         const headers: Record<string, string> = {
           Accept: "text/event-stream",
+          ...this.authHeader(),
           ...this.sessionHeaders(),
         };
         if (lastEventId) headers["Last-Event-ID"] = lastEventId;
@@ -960,11 +1131,24 @@ export class MCPClient extends EventTarget {
     else if (isNotification(msg)) this.handleServerNotification(msg);
   }
 
+  /** Route a successful HTTP response to the appropriate pending request. */
+  private async routeRPCResponse(res: Response): Promise<void> {
+    const ct = res.headers.get("Content-Type") ?? "";
+    if (ct.includes("text/event-stream") && res.body) {
+      await this.drainSSEStream(res.body);
+    } else {
+      this.routeResponse((await res.json()) as JSONRPCResponse);
+    }
+  }
+
   private routeResponse(msg: JSONRPCResponse): void {
     const p = this.pendingRequests.get(msg.id);
     if (!p) return;
     this.pendingRequests.delete(msg.id);
     clearTimeout(p.timeoutId);
+    if (p.progressToken !== undefined) {
+      this._progressTokenToId.delete(p.progressToken);
+    }
     if ("error" in msg)
       p.reject(new Error(`${msg.error.message} (code: ${msg.error.code})`));
     else p.resolve(msg.result);
@@ -998,6 +1182,10 @@ export class MCPClient extends EventTarget {
 
   private async dispatchServerRequest(req: JSONRPCRequest): Promise<unknown> {
     const p = req.params as Record<string, unknown> | undefined;
+
+    // Handler registered via setRequestHandler() takes priority over built-ins.
+    const customHandler = this._serverRequestHandlers.get(req.method);
+    if (customHandler) return customHandler({ method: req.method, params: p });
 
     switch (req.method) {
       // § basic/utilities/ping
@@ -1326,6 +1514,31 @@ export class MCPClient extends EventTarget {
         const message = p?.["message"] as string | undefined;
         if (token !== undefined && progress !== undefined) {
           this.onProgressCb?.(token, progress, total, message);
+          // Call per-request handler registered by callTool().
+          this._progressHandlers.get(token)?.({ progress, total });
+          // Optionally reset the per-request timeout on each progress notification.
+          const resetMs = this._progressResetMs.get(token);
+          if (resetMs !== undefined) {
+            const reqId = this._progressTokenToId.get(token);
+            if (reqId !== undefined) {
+              const pending = this.pendingRequests.get(reqId);
+              if (pending) {
+                clearTimeout(pending.timeoutId);
+                pending.timeoutId = setTimeout(() => {
+                  const pr = this.pendingRequests.get(reqId);
+                  this.pendingRequests.delete(reqId);
+                  if (pr?.progressToken !== undefined) {
+                    this._progressTokenToId.delete(pr.progressToken);
+                  }
+                  this.sendNotification("notifications/cancelled", {
+                    requestId: reqId,
+                    reason: "Timeout",
+                  }).catch(() => {});
+                  pending.reject(new Error("Request timed out: tools/call"));
+                }, resetMs);
+              }
+            }
+          }
           this.dispatchEvent(
             new CustomEvent("progress", {
               detail: { token, progress, total, message },
@@ -1364,6 +1577,13 @@ export class MCPClient extends EventTarget {
         break;
     }
 
+    // Call handler registered via setNotificationHandler().
+    const customNotifHandler = this._notificationHandlers.get(notif.method);
+    if (customNotifHandler) {
+      Promise.resolve(
+        customNotifHandler({ method: notif.method, params: notif.params }),
+      ).catch(console.error);
+    }
     this.onNotificationCb?.(notif.method, notif.params);
     this.dispatchEvent(
       new CustomEvent("notification", {
@@ -1485,8 +1705,14 @@ export class MCPClient extends EventTarget {
     return {
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
+      ...this.authHeader(),
       ...this.sessionHeaders(),
     };
+  }
+
+  private authHeader(): Record<string, string> {
+    const token = this._oauth?.getAccessToken();
+    return token ? { Authorization: `Bearer ${token}` } : {};
   }
 
   private sessionHeaders(): Record<string, string> {
@@ -1496,11 +1722,309 @@ export class MCPClient extends EventTarget {
     if (this.sessionId) h["MCP-Session-Id"] = this.sessionId;
     return h;
   }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // SDK-compatible high-level methods
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Returns usage instructions provided by the server during initialization.
+   * Matches `Client#getInstructions()` in the MCP TypeScript SDK.
+   */
+  getInstructions(): string | undefined {
+    return this._instructions ?? undefined;
+  }
+
+  /**
+   * Alias for {@link disconnect}. Matches `Client#close()` in the MCP TypeScript SDK.
+   */
+  close(): Promise<void> {
+    return this.disconnect();
+  }
+
+  // ── Tools ──────────────────────────────────────────────────────────────────
+
+  /** List tools offered by the server (cursor-paginated). */
+  listTools(params?: { cursor?: string }): Promise<{
+    tools: Tool[];
+    nextCursor?: string;
+  }> {
+    return this.request(
+      "tools/list",
+      params?.cursor !== undefined ? { cursor: params.cursor } : undefined,
+    );
+  }
+
+  /**
+   * Call a tool by name. Supports progress callbacks, per-request timeout
+   * reset on progress, and an absolute `maxTotalTimeout` ceiling.
+   * Matches `Client#callTool()` in the MCP TypeScript SDK.
+   */
+  async callTool(
+    params: { name: string; arguments?: Record<string, unknown> },
+    options?: CallToolOptions,
+  ): Promise<CallToolResult> {
+    const needsToken = !!(
+      options?.onprogress || options?.resetTimeoutOnProgress
+    );
+    const progressToken = needsToken
+      ? (crypto.randomUUID() as string)
+      : undefined;
+
+    if (progressToken !== undefined && options?.onprogress) {
+      this._progressHandlers.set(progressToken, options.onprogress);
+    }
+    if (progressToken !== undefined && options?.resetTimeoutOnProgress) {
+      this._progressResetMs.set(
+        progressToken,
+        options.timeout ?? this.defaultTimeoutMs,
+      );
+    }
+
+    const reqOpts: RequestOptions = {
+      timeoutMs: options?.timeout ?? this.defaultTimeoutMs,
+      ...(progressToken !== undefined && { progressToken }),
+    };
+
+    const body: Record<string, unknown> = { name: params.name };
+    if (params.arguments !== undefined) body["arguments"] = params.arguments;
+
+    try {
+      const maxTotalTimeout = options?.maxTotalTimeout;
+      if (maxTotalTimeout !== undefined) {
+        let maxTimer: ReturnType<typeof setTimeout> | undefined;
+        const maxPromise = new Promise<never>((_, rej) => {
+          maxTimer = setTimeout(
+            () => rej(new Error("callTool exceeded maxTotalTimeout")),
+            maxTotalTimeout,
+          );
+        });
+        return await Promise.race([
+          this.request<CallToolResult>("tools/call", body, reqOpts).finally(
+            () => clearTimeout(maxTimer),
+          ),
+          maxPromise,
+        ]);
+      }
+      return await this.request<CallToolResult>("tools/call", body, reqOpts);
+    } finally {
+      if (progressToken !== undefined) {
+        this._progressHandlers.delete(progressToken);
+        this._progressResetMs.delete(progressToken);
+        // _progressTokenToId cleanup is handled by routeResponse / timeout handler
+      }
+    }
+  }
+
+  // ── Resources ──────────────────────────────────────────────────────────────
+
+  /** List resources offered by the server (cursor-paginated). */
+  listResources(params?: { cursor?: string }): Promise<{
+    resources: Resource[];
+    nextCursor?: string;
+  }> {
+    return this.request(
+      "resources/list",
+      params?.cursor !== undefined ? { cursor: params.cursor } : undefined,
+    );
+  }
+
+  /** Read the contents of a resource by URI. */
+  readResource(params: { uri: string }): Promise<{
+    contents: Array<{
+      uri: string;
+      mimeType?: string;
+      text?: string;
+      blob?: string;
+    }>;
+  }> {
+    return this.request("resources/read", { uri: params.uri });
+  }
+
+  /** List URI templates for dynamic resources (cursor-paginated). */
+  listResourceTemplates(params?: { cursor?: string }): Promise<{
+    resourceTemplates: ResourceTemplate[];
+    nextCursor?: string;
+  }> {
+    return this.request(
+      "resources/templates/list",
+      params?.cursor !== undefined ? { cursor: params.cursor } : undefined,
+    );
+  }
+
+  /** Subscribe to change notifications for a resource URI. */
+  subscribeResource(params: { uri: string }): Promise<void> {
+    return this.request("resources/subscribe", { uri: params.uri });
+  }
+
+  /** Unsubscribe from change notifications for a resource URI. */
+  unsubscribeResource(params: { uri: string }): Promise<void> {
+    return this.request("resources/unsubscribe", { uri: params.uri });
+  }
+
+  // ── Prompts ────────────────────────────────────────────────────────────────
+
+  /** List prompt templates offered by the server (cursor-paginated). */
+  listPrompts(params?: { cursor?: string }): Promise<{
+    prompts: Prompt[];
+    nextCursor?: string;
+  }> {
+    return this.request(
+      "prompts/list",
+      params?.cursor !== undefined ? { cursor: params.cursor } : undefined,
+    );
+  }
+
+  /** Retrieve a prompt template with arguments filled in. */
+  getPrompt(params: {
+    name: string;
+    arguments?: Record<string, string>;
+  }): Promise<{
+    description?: string;
+    messages: Array<{ role: "user" | "assistant"; content: unknown }>;
+  }> {
+    return this.request("prompts/get", {
+      name: params.name,
+      ...(params.arguments !== undefined && { arguments: params.arguments }),
+    });
+  }
+
+  // ── Completions ────────────────────────────────────────────────────────────
+
+  /** Request argument completion suggestions for a prompt or resource. */
+  complete(params: CompleteParams): Promise<{ completion: CompletionResult }> {
+    return this.request("completion/complete", {
+      ref: params.ref,
+      argument: params.argument,
+    });
+  }
+
+  // ── Handler registries ─────────────────────────────────────────────────────
+
+  /**
+   * Register a handler for a specific server notification method.
+   * Replaces any previous handler for the same method.
+   * Matches `Client#setNotificationHandler()` in the MCP TypeScript SDK.
+   */
+  setNotificationHandler(
+    method: string,
+    handler: (notification: {
+      method: string;
+      params?: unknown;
+    }) => void | Promise<void>,
+  ): void {
+    this._notificationHandlers.set(method, handler);
+  }
+
+  /**
+   * Register a handler for a server-initiated request method.
+   * Takes precedence over `onSamplingRequest` / `onElicitationRequest`
+   * constructor options for the same method.
+   * Matches `Client#setRequestHandler()` in the MCP TypeScript SDK.
+   */
+  setRequestHandler(
+    method: string,
+    handler: (request: {
+      method: string;
+      params?: unknown;
+    }) => Promise<unknown>,
+  ): void {
+    this._serverRequestHandlers.set(method, handler);
+  }
+
+  // ── Logging ────────────────────────────────────────────────────────────────
+
+  /**
+   * Ask the server to send only log messages at or above `level`.
+   * Matches `Client#setLoggingLevel()` in the MCP TypeScript SDK.
+   */
+  setLoggingLevel(level: LoggingLevel): Promise<void> {
+    return this.request("logging/setLevel", { level });
+  }
+
+  // ── Roots supplementary API ────────────────────────────────────────────────
+
+  /**
+   * Manually send `notifications/roots/list_changed` to the server.
+   * Use this when managing roots outside the `addRoot` / `removeRoot` API.
+   * Matches `Client#sendRootsListChanged()` in the MCP TypeScript SDK.
+   */
+  sendRootsListChanged(): Promise<void> {
+    return this.sendNotification("notifications/roots/list_changed");
+  }
+
+  // ── OAuth authorization (§ basic/authorization) ───────────────────────────
+
+  /**
+   * Start the OAuth 2.1 authorization flow.
+   *
+   * Discovers the authorization server, builds a PKCE authorization URL, and
+   * calls `provider.redirectToAuthorization(url)` automatically.  Returns the
+   * URL so callers can also handle the redirect themselves if needed.
+   *
+   * After the user completes auth in the browser and is redirected back to
+   * `redirectUri`, call `finishAuth(callbackUrl)` with the full callback URL.
+   * Then call `connect()` to establish the MCP session.
+   *
+   * @param wwwAuthHeader  Optional `WWW-Authenticate` header value from a 401
+   *                       response.  Provides the `resource_metadata` URL and
+   *                       scope hints when available.
+   * @throws {Error}  If no `auth` provider was configured.
+   */
+  async authorize(wwwAuthHeader?: string): Promise<URL> {
+    if (!this._oauth) {
+      throw new Error(
+        "No auth provider configured. Set MCPClientOptions.auth before calling authorize().",
+      );
+    }
+    const url = await this._oauth.buildAuthorizationUrl(wwwAuthHeader);
+    await this._oauth.provider.redirectToAuthorization(url);
+    return url;
+  }
+
+  /**
+   * Complete the OAuth 2.1 authorization flow after the browser callback.
+   *
+   * Call this from your OAuth callback handler with the full callback URL
+   * (including `code` and `state` query parameters).  After this resolves,
+   * tokens are persisted and `connect()` can be called successfully.
+   *
+   * @param callbackUrl  The full URL the browser was redirected to, e.g.
+   *                     `new URL(window.location.href)`.
+   * @throws {Error}  If no `auth` provider was configured or state mismatches.
+   */
+  async finishAuth(callbackUrl: URL | string): Promise<void> {
+    if (!this._oauth) {
+      throw new Error(
+        "No auth provider configured. Set MCPClientOptions.auth before calling finishAuth().",
+      );
+    }
+    await this._oauth.finishAuthorization(callbackUrl);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Resolve the MCP endpoint to a canonical absolute URL suitable for use as the
+ * OAuth `resource` parameter (RFC 8707).  Strips fragment, query string, and
+ * trailing slash per spec § 8.1.
+ */
+function deriveResourceUrl(endpoint: string): string {
+  try {
+    const base =
+      typeof window !== "undefined" ? window.location.href : undefined;
+    const url = new URL(endpoint, base);
+    url.hash = "";
+    url.search = "";
+    const href = url.href;
+    return href.endsWith("/") ? href.slice(0, -1) : href;
+  } catch {
+    return endpoint;
+  }
+}
 
 function isTerminalStatus(s: TaskStatus): boolean {
   return s === "completed" || s === "failed" || s === "cancelled";
